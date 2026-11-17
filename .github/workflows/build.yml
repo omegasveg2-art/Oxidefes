@@ -1,0 +1,392 @@
+name: build-libox
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write sources
+        run: |
+          mkdir -p src
+          cat > src/CMakeLists.txt <<'EOF_CMAKE'
+          cmake_minimum_required(VERSION 3.22)
+          project(ox CXX)
+          set(CMAKE_CXX_STANDARD 17)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+          include(FetchContent)
+          FetchContent_Declare(imgui GIT_REPOSITORY https://github.com/ocornut/imgui.git GIT_TAG v1.90.9 GIT_SHALLOW TRUE)
+          FetchContent_MakeAvailable(imgui)
+
+          add_library(ox SHARED
+              main.cpp
+              ${imgui_SOURCE_DIR}/imgui.cpp
+              ${imgui_SOURCE_DIR}/imgui_draw.cpp
+              ${imgui_SOURCE_DIR}/imgui_tables.cpp
+              ${imgui_SOURCE_DIR}/imgui_widgets.cpp
+              ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp)
+
+          target_compile_definitions(ox PRIVATE IMGUI_IMPL_OPENGL_ES3)
+          target_include_directories(ox PRIVATE ${imgui_SOURCE_DIR} ${imgui_SOURCE_DIR}/backends)
+          target_compile_options(ox PRIVATE -O2 -fvisibility=hidden)
+          target_link_libraries(ox log EGL GLESv3 android dl)
+          EOF_CMAKE
+          cat > src/main.cpp <<'EOF_MAIN'
+          // libox.so — loads into the game process, GOT-hooks eglSwapBuffers (render) + AInputQueue_getEvent (touch).
+          // Inject: System.loadLibrary("ox") from the game's smali / LSPatch / Zygisk. Entry is the constructor below.
+          #include <jni.h>
+          #include <pthread.h>
+          #include <unistd.h>
+          #include <dlfcn.h>
+          #include <atomic>
+          #include <cstdio>
+          #include <cstdlib>
+          #include <cstring>
+          #include <string>
+          #include <link.h>
+          #include <elf.h>
+          #include <sys/mman.h>
+          #include <android/input.h>
+          #include <EGL/egl.h>
+          #include <GLES3/gl3.h>
+          #include "imgui.h"
+          #include "imgui_impl_opengl3.h"
+          #include "oxide_esp.h"
+
+          static struct { std::atomic<float> x{0}, y{0}; std::atomic<bool> down{false}; } g_in;
+          static EGLBoolean (*o_swap)(EGLDisplay, EGLSurface);
+          static int32_t (*o_getEvent)(AInputQueue*, AInputEvent**);
+          static bool g_init = false, g_menu = false;
+
+          // ---- config (JSON in the game's data dir) ----
+          static std::string CfgPath() {
+              char n[128] = {0};
+              if (FILE* f = fopen("/proc/self/cmdline", "r")) { fread(n, 1, 127, f); fclose(f); }
+              return std::string("/data/data/") + n + "/ox.json";
+          }
+          static void Save() {
+              FILE* f = fopen(CfgPath().c_str(), "w");
+              if (!f) return;
+              auto& c = ox::cfg;
+              fprintf(f, "{\"esp\":%d,\"box\":%d,\"health\":%d,\"name\":%d,\"dist\":%d,\"line\":%d,\"team\":%d,\"maxDist\":%.1f}",
+                      c.esp, c.box, c.health, c.name, c.dist, c.line, c.team, c.maxDist);
+              fclose(f);
+          }
+          static bool Key(const char* s, const char* k, double& v) {
+              char key[32]; snprintf(key, sizeof key, "\"%s\":", k);
+              const char* p = strstr(s, key);
+              if (!p) return false;
+              v = atof(p + strlen(key));
+              return true;
+          }
+          static void Load() {
+              FILE* f = fopen(CfgPath().c_str(), "r");
+              if (!f) return;
+              char b[512] = {0}; fread(b, 1, sizeof b - 1, f); fclose(f);
+              auto& c = ox::cfg; double v;
+          #define B(n) if (Key(b, #n, v)) c.n = v != 0;
+              B(esp) B(box) B(health) B(name) B(dist) B(line) B(team)
+          #undef B
+              if (Key(b, "maxDist", v)) c.maxDist = (float)v;
+          }
+
+          // ---- ui ----
+          static void Ui() {
+              ImGui::SetNextWindowPos(ImVec2(20, 20), ImGuiCond_Once);
+              ImGui::Begin("##ox_btn", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoBackground);
+              if (ImGui::Button("OX")) g_menu = !g_menu;
+              ImGui::End();
+              if (!g_menu) return;
+              ImGui::SetNextWindowPos(ImVec2(120, 60), ImGuiCond_Once);
+              ImGui::SetNextWindowSize(ImVec2(560, 460), ImGuiCond_Once);
+              if (ImGui::Begin("OX", &g_menu)) {
+                  if (ImGui::BeginTabBar("tabs")) {
+                      if (ImGui::BeginTabItem("ESP")) { ox::Menu(); ImGui::EndTabItem(); }
+                      if (ImGui::BeginTabItem("CONFIG")) {
+                          if (ImGui::Button("Save")) Save();
+                          ImGui::SameLine();
+                          if (ImGui::Button("Load")) Load();
+                          ImGui::EndTabItem();
+                      }
+                      ImGui::EndTabBar();
+                  }
+              }
+              ImGui::End();
+          }
+
+          // ---- hooks ----
+          static EGLBoolean h_swap(EGLDisplay d, EGLSurface s) {
+              EGLint w = 0, h = 0;
+              eglQuerySurface(d, s, EGL_WIDTH, &w);
+              eglQuerySurface(d, s, EGL_HEIGHT, &h);
+              if (w > 0 && h > 0) {
+                  if (!g_init) {
+                      ImGui::CreateContext();
+                      ImGuiIO& io = ImGui::GetIO();
+                      io.IniFilename = nullptr;
+                      io.FontGlobalScale = h / 720.f > 1.f ? h / 720.f : 1.f;
+                      ImGui::StyleColorsDark();
+                      ImGui_ImplOpenGL3_Init("#version 300 es");
+                      Load();
+                      g_init = true;
+                  }
+                  ImGuiIO& io = ImGui::GetIO();
+                  io.DisplaySize = ImVec2((float)w, (float)h);
+                  io.DeltaTime = 1.f / 60.f;
+                  io.AddMousePosEvent(g_in.x, g_in.y);
+                  io.AddMouseButtonEvent(0, g_in.down);
+                  ImGui_ImplOpenGL3_NewFrame();
+                  ImGui::NewFrame();
+                  ox::Esp();
+                  Ui();
+                  ImGui::Render();
+                  ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+              }
+              return o_swap(d, s);
+          }
+
+          static int32_t h_getEvent(AInputQueue* q, AInputEvent** ev) {
+              int32_t r = o_getEvent(q, ev);
+              if (r >= 0 && ev && *ev && AInputEvent_getType(*ev) == AINPUT_EVENT_TYPE_MOTION) {
+                  int a = AMotionEvent_getAction(*ev) & AMOTION_EVENT_ACTION_MASK;
+                  g_in.x = AMotionEvent_getX(*ev, 0);
+                  g_in.y = AMotionEvent_getY(*ev, 0);
+                  if (a == AMOTION_EVENT_ACTION_DOWN) g_in.down = true;
+                  else if (a == AMOTION_EVENT_ACTION_UP || a == AMOTION_EVENT_ACTION_CANCEL) g_in.down = false;
+              }
+              return r;
+          }
+
+          // ---- GOT hook: patch every loaded module that imports `sym` (no Dobby, no asm) ----
+          struct HookCtx { const char* sym; void* hook; void** orig; };
+          static int GotCb(struct dl_phdr_info* i, size_t, void* d) {
+              auto* c = (HookCtx*)d;
+              if (i->dlpi_name && strstr(i->dlpi_name, "libox")) return 0;
+              const ElfW(Dyn)* dyn = nullptr;
+              for (int k = 0; k < i->dlpi_phnum; k++)
+                  if (i->dlpi_phdr[k].p_type == PT_DYNAMIC) dyn = (const ElfW(Dyn)*)(i->dlpi_addr + i->dlpi_phdr[k].p_vaddr);
+              if (!dyn) return 0;
+              auto fix = [&](uintptr_t p) { return p < (uintptr_t)i->dlpi_addr ? p + i->dlpi_addr : p; };
+              const ElfW(Sym)* symtab = nullptr; const char* strtab = nullptr;
+              const ElfW(Rela)* tab[2] = {nullptr, nullptr}; size_t sz[2] = {0, 0};
+              for (; dyn->d_tag != DT_NULL; dyn++) {
+                  switch (dyn->d_tag) {
+                      case DT_SYMTAB: symtab = (const ElfW(Sym)*)fix(dyn->d_un.d_ptr); break;
+                      case DT_STRTAB: strtab = (const char*)fix(dyn->d_un.d_ptr); break;
+                      case DT_JMPREL: tab[0] = (const ElfW(Rela)*)fix(dyn->d_un.d_ptr); break;
+                      case DT_PLTRELSZ: sz[0] = dyn->d_un.d_val; break;
+                      case DT_RELA: tab[1] = (const ElfW(Rela)*)fix(dyn->d_un.d_ptr); break;
+                      case DT_RELASZ: sz[1] = dyn->d_un.d_val; break;
+                  }
+              }
+              if (!symtab || !strtab) return 0;
+              for (int t = 0; t < 2; t++) {
+                  if (!tab[t]) continue;
+                  for (size_t n = 0; n < sz[t] / sizeof(ElfW(Rela)); n++) {
+                      const ElfW(Rela)& r = tab[t][n];
+                      unsigned ty = ELF64_R_TYPE(r.r_info);
+                      if (ty != R_AARCH64_JUMP_SLOT && ty != R_AARCH64_GLOB_DAT) continue;
+                      if (strcmp(strtab + symtab[ELF64_R_SYM(r.r_info)].st_name, c->sym) != 0) continue;
+                      void** slot = (void**)(i->dlpi_addr + r.r_offset);
+                      uintptr_t pg = (uintptr_t)slot & ~(uintptr_t)4095;
+                      if (mprotect((void*)pg, 4096, PROT_READ | PROT_WRITE) != 0) continue;
+                      if (!*c->orig) *c->orig = *slot;
+                      *slot = c->hook;
+                  }
+              }
+              return 0;
+          }
+          static void GotHook(const char* sym, void* hook, void** orig) {
+              HookCtx c{sym, hook, orig};
+              dl_iterate_phdr(GotCb, &c);
+          }
+
+          static void* worker(void*) {
+              while (!dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD)) sleep(1);
+              sleep(5);
+              GotHook("eglSwapBuffers", (void*)h_swap, (void**)&o_swap);
+              GotHook("AInputQueue_getEvent", (void*)h_getEvent, (void**)&o_getEvent);
+              return nullptr;
+          }
+
+          __attribute__((constructor)) static void ox_ctor() {
+              pthread_t t;
+              pthread_create(&t, nullptr, worker, nullptr);
+              pthread_detach(t);
+          }
+          EOF_MAIN
+          cat > src/oxide_esp.h <<'EOF_HDR'
+          // oxide_esp.h — ESP for "Oxide" (Android, il2cpp, arm64, Mirror). Header-only, needs imgui.h.
+          // Nothing is hardcoded: classes/fields/methods are resolved by NAME via il2cpp exports, offsets come from the runtime.
+          // dump.cs: [FieldOffset]/[Address] attributes are bogus; only the trailing "// 0x" comments match script.json. Not used here.
+          // Obfuscated names (vd, XE, XU, Xq, cJQ...) change per build -> only readable names are used:
+          //   Oxide.PlayerManager{EnabledInstances, vitals, get_teamName}, vitals->..->XU.Entity -> XE{Health, DisplayName}, GenericVitals.m_MaxHealth
+          // Call ox::Init() once after libil2cpp.so is loaded, ox::Esp() every frame from your render hook, ox::Menu() inside your ESP tab.
+          // Play Integrity SDK is in the build, treat the account as burnable. Managed calls run on the GL thread — if it crashes, move ox::Snapshot() into a main-thread hook.
+          #pragma once
+          #include <dlfcn.h>
+          #include <cstdint>
+          #include <cstring>
+          #include <cmath>
+          #include <cstdio>
+          #include <vector>
+          #include <string>
+          #include "imgui.h"
+
+          namespace ox {
+
+          struct V3 { float x, y, z; };
+
+          struct Cfg {
+              bool esp = false, box = true, health = true, name = true, dist = true, line = false, team = false;
+              float maxDist = 400.f;
+              ImVec4 colEnemy{1.f, 0.25f, 0.25f, 1.f}, colTeam{0.25f, 0.9f, 0.4f, 1.f};
+          } cfg;
+
+          // ---- il2cpp api ----
+          static void* (*domain_get)();
+          static void* (*thread_attach)(void*);
+          static void** (*domain_get_assemblies)(void*, size_t*);
+          static void* (*assembly_get_image)(void*);
+          static void* (*class_from_name)(void*, const char*, const char*);
+          static void* (*class_get_parent)(void*);
+          static void* (*class_get_field)(void*, const char*);
+          static void* (*class_get_method)(void*, const char*, int);
+          static void* (*class_get_methods)(void*, void**);
+          static void* (*class_from_type)(void*);
+          static void* (*class_elem)(void*);
+          static int (*class_array_elem_size)(void*);
+          static int (*class_inst_size)(void*);
+          static void* (*obj_get_class)(void*);
+          static size_t (*field_offset)(void*);
+          static void* (*field_type)(void*);
+          static void (*field_static_get)(void*, void*);
+          static int (*method_param_count)(void*);
+          static void* (*method_ret_type)(void*);
+          static const char* (*type_name)(void*);
+          static const uint16_t* (*string_chars)(void*);
+          static int (*string_len)(void*);
+
+          static bool g_ok = false;
+          static size_t oVitals, oSlots, oLast, oSlotVal, szSlot;
+          static size_t oEntity, oHealth, oName;
+          static void *fEnabled, *mTransform, *mPosition, *mMain, *mW2S, *mScrW, *mScrH, *mTeam, *mHpGet;
+          static void* kHpClass;
+
+          template <class T> static void ld(T& f, void* h, const char* n) { f = (T)dlsym(h, n); }
+
+          static void* FindClass(const char* ns, const char* name) {
+              size_t n = 0; void** as = domain_get_assemblies(domain_get(), &n);
+              for (size_t i = 0; i < n; i++) {
+                  void* img = assembly_get_image(as[i]);
+                  if (void* k = class_from_name(img, ns, name)) return k;
+              }
+              return nullptr;
+          }
+
+          // field offset walking up the parent chain (fields live in obfuscated bases like XU / GenericVitals)
+          static long FieldOff(void* k, const char* name, void** outField = nullptr) {
+              for (; k; k = class_get_parent(k))
+                  if (void* f = class_get_field(k, name)) { if (outField) *outField = f; return (long)field_offset(f); }
+              return -1;
+          }
+
+          static std::string Str(void* s) {
+              if (!s) return {};
+              int n = string_len(s); const uint16_t* c = string_chars(s);
+              std::string o; for (int i = 0; i < n && i < 64; i++) o += c[i] < 128 ? (char)c[i] : '?';
+              return o;
+          }
+
+          template <class R> static R CallI(void* mi, void* self) { return ((R(*)(void*, void*))(*(void**)mi))(self, mi); }
+          template <class R> static R CallS(void* mi) { return ((R(*)(void*))(*(void**)mi))(mi); }
+
+          static bool Init() {
+              if (g_ok) return true;
+              void* h = dlopen("libil2cpp.so", RTLD_NOW | RTLD_NOLOAD);
+              if (!h) return false;
+              ld(domain_get, h, "il2cpp_domain_get"); ld(thread_attach, h, "il2cpp_thread_attach");
+              ld(domain_get_assemblies, h, "il2cpp_domain_get_assemblies"); ld(assembly_get_image, h, "il2cpp_assembly_get_image");
+              ld(class_from_name, h, "il2cpp_class_from_name"); ld(class_get_parent, h, "il2cpp_class_get_parent");
+              ld(class_get_field, h, "il2cpp_class_get_field_from_name"); ld(class_get_method, h, "il2cpp_class_get_method_from_name");
+              ld(class_get_methods, h, "il2cpp_class_get_methods"); ld(class_from_type, h, "il2cpp_class_from_type");
+              ld(class_elem, h, "il2cpp_class_get_element_class"); ld(class_array_elem_size, h, "il2cpp_class_array_element_size");
+              ld(class_inst_size, h, "il2cpp_class_instance_size"); ld(obj_get_class, h, "il2cpp_object_get_class");
+              ld(field_offset, h, "il2cpp_field_get_offset"); ld(field_type, h, "il2cpp_field_get_type");
+              ld(field_static_get, h, "il2cpp_field_static_get_value"); ld(method_param_count, h, "il2cpp_method_get_param_count");
+              ld(method_ret_type, h, "il2cpp_method_get_return_type"); ld(type_name, h, "il2cpp_type_get_name");
+              ld(string_chars, h, "il2cpp_string_chars"); ld(string_len, h, "il2cpp_string_length");
+              if (!domain_get || !class_from_name || !field_static_get || !string_chars) return false;
+              thread_attach(domain_get());
+
+              void* kPM = FindClass("Oxide", "PlayerManager");
+              void* kCam = FindClass("UnityEngine", "Camera");
+              void* kTr = FindClass("UnityEngine", "Transform");
+              void* kCmp = FindClass("UnityEngine", "Component");
+              void* kScr = FindClass("UnityEngine", "Screen");
+              if (!kPM || !kCam || !kTr || !kCmp || !kScr) return false;
+
+              fEnabled = class_get_field(kPM, "EnabledInstances");              // static HashSet<PlayerManager>
+              long ov = FieldOff(kPM, "vitals");
+              mTeam = class_get_method(kPM, "get_teamName", 0);
+              mTransform = class_get_method(kCmp, "get_transform", 0);
+              mPosition = class_get_method(kTr, "get_position", 0);
+              mMain = class_get_method(kCam, "get_main", 0);
+              mW2S = class_get_method(kCam, "WorldToScreenPoint", 1);            // (Vector3)
+              mScrW = class_get_method(kScr, "get_width", 0);
+              mScrH = class_get_method(kScr, "get_height", 0);
+              if (!fEnabled || ov < 0 || !mTransform || !mPosition || !mMain || !mW2S || !mScrW || !mScrH) return false;
+              oVitals = (size_t)ov;
+
+              // HashSet<PlayerManager> layout from the live type
+              void* set = nullptr; field_static_get(fEnabled, &set);
+              if (!set) return false;                                             // retry next frame, set is created lazily
+              void* kSet = obj_get_class(set);
+              void* fs = nullptr; long os = FieldOff(kSet, "_slots", &fs);
+              long ol = FieldOff(kSet, "_lastIndex");
+              if (os < 0 || ol < 0) return false;
+              oSlots = (size_t)os; oLast = (size_t)ol;
+              void* kArr = class_from_type(field_type(fs));
+              void* kSlot = class_elem(kArr);
+              long ovl = FieldOff(kSlot, "value");
+              if (ovl < 0) return false;
+              oSlotVal = (size_t)ovl - 0x10;                                      // value-type field offset includes boxed header
+              szSlot = (size_t)class_array_elem_size(kArr);
+              if (szSlot < 16 || szSlot > 64) szSlot = (size_t)class_inst_size(kSlot) - 0x10;
+
+              // PlayerVitals -> (XU.Entity) -> XE{Health, DisplayName}
+              void* kV = FindClass("Oxide", "PlayerVitals");
+              void* kXE = nullptr;
+              long oe = kV ? FieldOff(kV, "Entity", &kXE) : -1;
+              if (oe < 0) return false;
+              oEntity = (size_t)oe;
+              void* fent = nullptr; FieldOff(kV, "Entity", &fent);
+              kXE = class_from_type(field_type(fent));
+              long oh = FieldOff(kXE, "Health"), on = FieldOff(kXE, "DisplayName");
+              if (oh < 0) return false;
+              oHealth = (size_t)oh; oName = on < 0 ? 0 : (size_t)on;
+              void* fh = nullptr; FieldOff(kXE, "Health", &fh);
+              kHpClass = class_from_type(field_type(fh));                         // Xq<float>
+
+              // Xq<float> getter: obfuscated name, so pick by signature: 0 params -> System.Single
+              void* it = nullptr;
+              while (void* m = class_get_methods(kHpClass, &it)) {
+                  if (method_param_count(m) == 0 && strcmp(type_name(method_ret_type(m)), "System.Single") == 0) { mHpGet = m; break; }
+              }
+              if (!mHpGet) return false;
+              g_ok = true;
+              return true;
+          }
+
+          struct Ent { V3 pos; std::string name, team; float hp; };
+
+          static V3 PosOf(void* comp) {
+              void* t = CallI<void*>(mTransform, comp);
+              return t ? CallI<V3>(mPosition, t) : V3{0, 0, 0};
+          }
+
+          // Unity screen space: origin bottom-left, z<0 => behind camera
+          static bool W
